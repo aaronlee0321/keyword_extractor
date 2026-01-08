@@ -2,33 +2,82 @@
 Document service for uploading and indexing documents.
 """
 import re
+import string
 from pathlib import Path
 from typing import Dict, Any, Optional, Callable
-from PyPDF2 import PdfReader
 from io import BytesIO
-from utils.text_utils import split_text_with_headings
+import tempfile
+import os
+from utils.text_utils import split_by_sections
 from services.storage_service import insert_document, insert_chunks
 from config.settings import CHUNK_SIZE
 from services.embedding_service import embed_document_chunks
 
-def pdf_to_text(pdf_bytes: bytes) -> str:
+# Control characters to clean from markdown
+_CONTROL_CHARS = {
+    *[c for c in map(chr, range(0x00, 0x20)) if c not in ("\t", "\n", "\r")],
+    chr(0x7F),
+    "\uFFFD",  # Replacement character
+}
+_CONTROL_TRANSLATION = {ord(c): None for c in _CONTROL_CHARS}
+
+
+def clean_markdown(text: str) -> str:
+    """Remove non-printable/control artifacts while preserving content & layout."""
+    cleaned = text.translate(_CONTROL_TRANSLATION)
+    return cleaned.encode("utf-8", "ignore").decode("utf-8")
+
+
+def pdf_to_markdown(pdf_bytes: bytes) -> str:
     """
-    Convert PDF bytes to text.
+    Convert PDF bytes to markdown using Docling.
+    Preserves structure and headings for better section detection.
     
     Args:
         pdf_bytes: PDF file bytes
     
     Returns:
-        Extracted text
+        Markdown text with preserved structure
     """
-    pdf_file = BytesIO(pdf_bytes)
-    reader = PdfReader(pdf_file)
+    try:
+        from docling.document_converter import DocumentConverter
+        
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(pdf_bytes)
+            tmp_path = tmp_file.name
+        
+        try:
+            # Convert to markdown
+            converter = DocumentConverter()
+            result = converter.convert(tmp_path)
+            markdown = result.document.export_to_markdown()
+            markdown = clean_markdown(markdown)
+            return markdown
+        finally:
+            # Clean up temp file
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
     
-    text_parts = []
-    for page in reader.pages:
-        text_parts.append(page.extract_text())
-    
-    return "\n\n".join(text_parts)
+    except ImportError:
+        # Fallback to simple text extraction if docling not available
+        from PyPDF2 import PdfReader
+        pdf_file = BytesIO(pdf_bytes)
+        reader = PdfReader(pdf_file)
+        text_parts = []
+        for page in reader.pages:
+            text_parts.append(page.extract_text())
+        return "\n\n".join(text_parts)
+    except Exception as e:
+        # Fallback on any error
+        print(f"Warning: Docling conversion failed, using fallback: {e}")
+        from PyPDF2 import PdfReader
+        pdf_file = BytesIO(pdf_bytes)
+        reader = PdfReader(pdf_file)
+        text_parts = []
+        for page in reader.pages:
+            text_parts.append(page.extract_text())
+        return "\n\n".join(text_parts)
 
 def generate_doc_id(filename: str) -> str:
     """
@@ -64,11 +113,11 @@ def upload_and_index_document(
         Dict with status, message, doc_id
     """
     try:
-        # Step 1: Convert PDF to text
+        # Step 1: Convert PDF to markdown (preserves structure)
         if progress_callback:
-            progress_callback("Converting PDF to text...")
+            progress_callback("Converting PDF to markdown...")
         
-        text = pdf_to_text(pdf_bytes)
+        text = pdf_to_markdown(pdf_bytes)
         
         if not text or len(text.strip()) < 10:
             return {'status': 'error', 'message': 'Failed to extract text from PDF or PDF is empty'}
@@ -76,14 +125,19 @@ def upload_and_index_document(
         # Step 2: Generate document ID
         doc_id = generate_doc_id(filename)
         
-        # Step 3: Split into chunks with headings
+        # Step 3: Split into sections first, then chunk each section
         if progress_callback:
-            progress_callback("Splitting text into chunks with headings...")
+            progress_callback("Splitting document into sections, then chunking each section...")
         
-        chunks_with_headings = split_text_with_headings(text, chunk_size=CHUNK_SIZE)
+        # First split into sections, then chunk each section using size-based chunking
+        chunks_with_headings = split_by_sections(text, chunk_size=CHUNK_SIZE)
         
         if not chunks_with_headings:
             return {'status': 'error', 'message': 'No chunks created from document'}
+        
+        # Debug: Log chunk count
+        unique_sections = set(h for _, h in chunks_with_headings if h)
+        print(f"Created {len(chunks_with_headings)} chunks from {len(unique_sections)} unique sections")
         
         # Step 4: Prepare chunks for database
         if progress_callback:

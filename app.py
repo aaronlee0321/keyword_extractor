@@ -7,20 +7,58 @@ from services.search_service import keyword_search
 from services.storage_service import list_documents, delete_document
 
 def simple_search_names(keyword):
-    """Return unique document names matching a keyword."""
+    """Return hierarchical structure of documents and their sections matching a keyword."""
     if not keyword or not keyword.strip():
         return "Please enter a keyword to search."
     results = keyword_search(keyword.strip(), limit=100)
     if not results:
         return "No results found."
-    names = []
-    seen = set()
+    
+    # Group results by document, preserving section order and hierarchy
+    doc_sections = {}
     for r in results:
-        name = r.get('doc_name')
-        if name and name not in seen:
-            seen.add(name)
-            names.append(name)
-    return "\n".join(names)
+        doc_name = r.get('doc_name', 'Unknown Document')
+        section = r.get('section_heading')
+        
+        if doc_name not in doc_sections:
+            doc_sections[doc_name] = []
+        
+        if section:
+            # Only add if not already in list (preserve order, avoid duplicates)
+            if section not in doc_sections[doc_name]:
+                doc_sections[doc_name].append(section)
+        else:
+            if "(No section)" not in doc_sections[doc_name]:
+                doc_sections[doc_name].append("(No section)")
+    
+    # Build hierarchical output with tree structure
+    output_lines = []
+    for doc_name, sections in sorted(doc_sections.items()):
+        # Extract just the filename from full path for cleaner display
+        display_name = doc_name.split('\\')[-1] if '\\' in doc_name else doc_name.split('/')[-1] if '/' in doc_name else doc_name
+        
+        # Add document name
+        output_lines.append(f"📄 {display_name}")
+        
+        if not sections:
+            output_lines.append("  └─ (No sections found)")
+        else:
+            # Add sections with tree structure
+            for i, section in enumerate(sections):
+                if i == len(sections) - 1:
+                    # Last section - use └─
+                    output_lines.append(f"  └─ {section}")
+                else:
+                    # Not last section - use ├─
+                    output_lines.append(f"  ├─ {section}")
+        
+        # Add blank line between documents
+        output_lines.append("")
+    
+    if not output_lines:
+        return "No results found."
+    
+    return "\n".join(output_lines)
 
 def upload_document(file, progress=gr.Progress()):
     """Handle document upload and indexing."""
@@ -87,6 +125,8 @@ def perform_search(keyword, document_filter, limit):
             output += f"**Document:** {result['doc_name']}\n"
             if result.get('section_heading'):
                 output += f"**Section:** {result['section_heading']}\n"
+            else:
+                output += f"**Section:** (No section)\n"
             output += f"**Relevance:** {result['relevance']:.2%}\n"
             output += f"**Content:**\n{result['content'][:500]}...\n\n"
             output += "---\n\n"
@@ -181,13 +221,17 @@ with gr.Blocks(title="Keyword Extractor", theme=gr.themes.Soft()) as app:
             )
         
         with gr.Tab("Simple Search"):
-            gr.Markdown("### Enter a keyword to list matching document names")
+            gr.Markdown("### Enter a keyword to see matching documents and sections")
             simple_keyword = gr.Textbox(
                 label="Keyword",
                 placeholder="e.g., transformer, alignment, privacy",
             )
-            simple_btn = gr.Button("List Document Names", variant="primary")
-            simple_output = gr.Textbox(label="Document Names", lines=10)
+            simple_btn = gr.Button("Search Documents & Sections", variant="primary")
+            simple_output = gr.Textbox(
+                label="Documents & Sections (Hierarchical View)", 
+                lines=15,
+                placeholder="Results will show documents with their matching sections in a hierarchical structure..."
+            )
             simple_btn.click(
                 fn=simple_search_names,
                 inputs=[simple_keyword],
