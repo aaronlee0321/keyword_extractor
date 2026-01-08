@@ -5,6 +5,7 @@ import gradio as gr
 from services.document_service import upload_and_index_document
 from services.search_service import keyword_search
 from services.storage_service import list_documents, delete_document
+from services.explainer_service import explain_keyword
 
 def simple_search_names(keyword):
     """Return hierarchical structure of documents and their sections matching a keyword."""
@@ -241,6 +242,421 @@ with gr.Blocks(title="Keyword Extractor", theme=gr.themes.Soft()) as app:
                 fn=simple_search_names,
                 inputs=[simple_keyword],
                 outputs=[simple_output],
+            )
+        
+        with gr.Tab("Document Explainer"):
+            gr.Markdown("### Get Detailed Explanations from Documents")
+            gr.Markdown("Enter a keyword, select documents/sections, and get AI-generated explanations.")
+            
+            with gr.Row():
+                explainer_keyword = gr.Textbox(
+                    label="Keyword/Query",
+                    placeholder="e.g., tank movement, combat system, progression",
+                    scale=3
+                )
+                explainer_search_btn = gr.Button("Search", variant="secondary", scale=1)
+            
+            # Results display with checkboxes
+            # Use a State to track last search keyword to detect when search changes
+            last_search_keyword = gr.State(value=None)
+            
+            explainer_results = gr.Checkboxgroup(
+                label="Search Results - Select Documents/Sections to Explain",
+                choices=[],
+                value=[],  # Explicitly set initial value to empty list
+                visible=False,
+                interactive=True
+            )
+            
+            search_status = gr.Markdown(visible=False)
+            
+            with gr.Row():
+                select_all_btn = gr.Button("Select All", variant="secondary", scale=1)
+                select_none_btn = gr.Button("Select None", variant="secondary", scale=1)
+                explain_btn = gr.Button("Generate Explanation", variant="primary", scale=2)
+            
+            # Output area
+            explanation_output = gr.Markdown(
+                label="Explanation",
+                visible=True
+            )
+            
+            source_chunks_output = gr.Markdown(
+                label="Source Chunks (Click to expand)",
+                visible=True
+            )
+            
+            metadata_output = gr.Markdown(
+                label="Metadata",
+                visible=True
+            )
+            
+            # Store search results internally
+            explainer_search_results_store = gr.State(value=[])
+            
+            def search_for_explainer(keyword, last_keyword):
+                """Search for keyword and return results as checkboxes for selection."""
+                # Always clear selections when keyword changes
+                keyword_stripped = keyword.strip() if keyword else ""
+                
+                if not keyword or not keyword_stripped:
+                    return (
+                        gr.update(choices=[], value=[], visible=False),
+                        [],
+                        gr.update(value="Please enter a keyword to search.", visible=True),
+                        None  # Update last_search_keyword to None
+                    )
+                
+                try:
+                    results = keyword_search(keyword_stripped, limit=100)
+                    if not results:
+                        return (
+                            gr.update(choices=[], value=[], visible=False),
+                            [],
+                            gr.update(value="No results found. Try a different keyword.", visible=True),
+                            keyword_stripped  # Update last_search_keyword
+                        )
+                    
+                    # Group by document and section
+                    # Filter out items with no section (section_heading is None or empty)
+                    doc_sections = {}
+                    for r in results:
+                        doc_id = r.get('doc_id')
+                        doc_name = r.get('doc_name', 'Unknown Document')
+                        section = r.get('section_heading')
+                        
+                        # Skip items without a section heading
+                        if not section or section.strip() == '':
+                            continue
+                        
+                        # Create unique key for document-section pair
+                        key = (doc_id, doc_name, section)
+                        if key not in doc_sections:
+                            doc_sections[key] = {
+                                'doc_id': doc_id,
+                                'doc_name': doc_name,
+                                'section_heading': section,
+                                'relevance': r.get('relevance', 0.0)
+                            }
+                    
+                    # Sort by relevance (highest first)
+                    sorted_items = sorted(
+                        doc_sections.values(),
+                        key=lambda x: x['relevance'],
+                        reverse=True
+                    )
+                    
+                    # Create checkbox choices and store data
+                    choices = []
+                    store_data = []
+                    
+                    for item in sorted_items:
+                        # Extract filename for display (remove .pdf extension if present)
+                        display_name = item['doc_name']
+                        if '\\' in display_name:
+                            display_name = display_name.split('\\')[-1]
+                        elif '/' in display_name:
+                            display_name = display_name.split('/')[-1]
+                        
+                        # Remove .pdf extension for cleaner display
+                        if display_name.lower().endswith('.pdf'):
+                            display_name = display_name[:-4]
+                        
+                        section_display = item['section_heading'] if item['section_heading'] else "(No section)"
+                        
+                        # Create choice label
+                        choice_label = f"{display_name} → {section_display}"
+                        choices.append(choice_label)
+                        
+                        # Store actual data
+                        store_data.append({
+                            'doc_id': item['doc_id'],
+                            'section_heading': item['section_heading']
+                        })
+                    
+                    status_msg = f"✅ Found {len(sorted_items)} document/section combinations. Select which ones to explain."
+                    
+                    # Always clear selections when search changes
+                    # IMPORTANT: Set value=[] FIRST, then update choices to prevent validation errors
+                    return (
+                        gr.update(value=[], choices=choices, visible=True),  # Clear value BEFORE setting choices
+                        store_data,
+                        gr.update(value=status_msg, visible=True),
+                        keyword_stripped  # Update last_search_keyword
+                    )
+                    
+                except Exception as e:
+                    import traceback
+                    return (
+                        gr.update(choices=[], value=[], visible=False),
+                        [],
+                        gr.update(value=f"❌ Error: {str(e)}\n\n{traceback.format_exc()}", visible=True),
+                        keyword_stripped if keyword_stripped else None  # Update last_search_keyword
+                    )
+            
+            def generate_explanation(keyword, selected_choices, stored_results):
+                """Generate explanation from selected items."""
+                if not keyword or not keyword.strip():
+                    return (
+                        gr.update(value="Please enter a keyword first.", visible=True),
+                        gr.update(visible=False),
+                        gr.update(visible=False)
+                    )
+                
+                if not stored_results or len(stored_results) == 0:
+                    return (
+                        gr.update(value="Please search for a keyword first.", visible=True),
+                        gr.update(visible=False),
+                        gr.update(visible=False)
+                    )
+                
+                try:
+                    # Get selected items based on checkbox selection
+                    selected_items = []
+                    
+                    # Handle None or empty selected_choices
+                    if not selected_choices:
+                        selected_choices = []
+                    
+                    # Build choice label to item mapping from stored_results
+                    # This creates the valid choices set for validation
+                    choice_to_item = {}
+                    valid_choices = set()
+                    
+                    for item in stored_results:
+                        doc_id = item.get('doc_id')
+                        section = item.get('section_heading')
+                        
+                        # Get doc_name from database for display
+                        from services.storage_service import list_documents
+                        docs = list_documents()
+                        doc_name = 'Unknown'
+                        for doc in docs:
+                            if doc.get('doc_id') == doc_id:
+                                doc_name = doc.get('name', 'Unknown')
+                                break
+                        
+                        # Extract filename (same logic as search_for_explainer)
+                        display_name = doc_name
+                        if '\\' in display_name:
+                            display_name = display_name.split('\\')[-1]
+                        elif '/' in display_name:
+                            display_name = display_name.split('/')[-1]
+                        
+                        # Remove .pdf extension for cleaner display (must match search_for_explainer)
+                        if display_name.lower().endswith('.pdf'):
+                            display_name = display_name[:-4]
+                        
+                        section_display = section if section else "(No section)"
+                        choice_label = f"{display_name} → {section_display}"
+                        choice_to_item[choice_label] = {
+                            'doc_id': doc_id,
+                            'section_heading': section
+                        }
+                        valid_choices.add(choice_label)
+                    
+                    # Filter selected_choices to only include valid ones
+                    # This prevents errors when search results change between searches
+                    valid_selected_choices = [c for c in selected_choices if c in valid_choices]
+                    
+                    if not valid_selected_choices:
+                        return (
+                            gr.update(value="Please select at least one document/section to explain. (Note: Previous selections were cleared due to new search results.)", visible=True),
+                            gr.update(visible=False),
+                            gr.update(visible=False)
+                        )
+                    
+                    # Map valid selected choices to items
+                    for choice in valid_selected_choices:
+                        if choice in choice_to_item:
+                            selected_items.append(choice_to_item[choice])
+                    
+                    if not selected_items:
+                        return (
+                            gr.update(value="Please select at least one document/section to explain.", visible=True),
+                            gr.update(visible=False),
+                            gr.update(visible=False)
+                        )
+                    
+                    # Generate explanation
+                    result = explain_keyword(keyword.strip(), selected_items, use_hyde=True)
+                    
+                    if result.get('error'):
+                        return (
+                            gr.update(value=f"❌ Error: {result['error']}", visible=True),
+                            gr.update(visible=False),
+                            gr.update(visible=False)
+                        )
+                    
+                    # Build explanation output
+                    explanation_text = f"## Explanation\n\n{result.get('explanation', 'No explanation generated.')}"
+                    
+                    # Build source chunks output
+                    source_chunks = result.get('source_chunks', [])
+                    chunks_text = f"### Source Chunks ({len(source_chunks)} chunks used)\n\n"
+                    for i, chunk in enumerate(source_chunks[:10], 1):  # Show first 10
+                        section = chunk.get('section_heading') or 'No section'
+                        content = chunk.get('content') or ''
+                        content_preview = content[:200] if content else '(Empty chunk)'
+                        chunks_text += f"**Chunk {i}** (Section: {section})\n"
+                        chunks_text += f"{content_preview}...\n\n"
+                    
+                    # Build metadata output
+                    metadata_text = "### Metadata\n\n"
+                    metadata_text += f"- **HYDE Query:** {result.get('hyde_query', keyword)}\n"
+                    metadata_text += f"- **Language Detected:** {result.get('language', 'english')}\n"
+                    metadata_text += f"- **Chunks Used:** {result.get('chunks_used', 0)}\n"
+                    if result.get('hyde_timing'):
+                        timing = result['hyde_timing']
+                        if 'total_time' in timing:
+                            metadata_text += f"- **HYDE Timing:** {timing['total_time']}s\n"
+                    
+                    return (
+                        gr.update(value=explanation_text),
+                        gr.update(value=chunks_text),
+                        gr.update(value=metadata_text)
+                    )
+                    
+                except Exception as e:
+                    import traceback
+                    return (
+                        gr.update(value=f"❌ Error generating explanation: {str(e)}\n\n{traceback.format_exc()}", visible=True),
+                        gr.update(visible=False),
+                        gr.update(visible=False)
+                    )
+            
+            def select_all_items(stored_results):
+                """Select all items - return all choice labels."""
+                if not stored_results or len(stored_results) == 0:
+                    return gr.update()
+                
+                # Get document names from database
+                from services.storage_service import list_documents
+                docs = {doc.get('doc_id'): doc.get('name', 'Unknown') for doc in list_documents()}
+                
+                choices = []
+                for item in stored_results:
+                    doc_id = item.get('doc_id')
+                    section = item.get('section_heading')
+                    
+                    doc_name = docs.get(doc_id, 'Unknown')
+                    
+                    # Extract filename (same logic as search_for_explainer)
+                    display_name = doc_name
+                    if '\\' in display_name:
+                        display_name = display_name.split('\\')[-1]
+                    elif '/' in display_name:
+                        display_name = display_name.split('/')[-1]
+                    
+                    # Remove .pdf extension for cleaner display (must match search_for_explainer)
+                    if display_name.lower().endswith('.pdf'):
+                        display_name = display_name[:-4]
+                    
+                    section_display = section if section else "(No section)"
+                    choice_label = f"{display_name} → {section_display}"
+                    choices.append(choice_label)
+                
+                return gr.update(value=choices)
+            
+            def select_none_items():
+                """Deselect all items - return empty list."""
+                return gr.update(value=[])
+            
+            # Handler to clear checkbox selections when choices change
+            # This ensures old selections don't persist when new search results are shown
+            def ensure_valid_selections(selected_choices, stored_results):
+                """Filter out any selections that aren't in the current choices."""
+                if not stored_results or not selected_choices:
+                    return []
+                
+                # Build valid choices set from stored_results
+                from services.storage_service import list_documents
+                docs = {doc.get('doc_id'): doc.get('name', 'Unknown') for doc in list_documents()}
+                
+                valid_choices = set()
+                for item in stored_results:
+                    doc_id = item.get('doc_id')
+                    section = item.get('section_heading')
+                    doc_name = docs.get(doc_id, 'Unknown')
+                    
+                    display_name = doc_name
+                    if '\\' in display_name:
+                        display_name = display_name.split('\\')[-1]
+                    elif '/' in display_name:
+                        display_name = display_name.split('/')[-1]
+                    
+                    if display_name.lower().endswith('.pdf'):
+                        display_name = display_name[:-4]
+                    
+                    section_display = section if section else "(No section)"
+                    choice_label = f"{display_name} → {section_display}"
+                    valid_choices.add(choice_label)
+                
+                # Filter to only valid choices
+                return [c for c in selected_choices if c in valid_choices]
+            
+            # Event handlers
+            explainer_search_btn.click(
+                fn=search_for_explainer,
+                inputs=[explainer_keyword, last_search_keyword],
+                outputs=[explainer_results, explainer_search_results_store, search_status, last_search_keyword]
+            )
+            
+            explainer_keyword.submit(
+                fn=search_for_explainer,
+                inputs=[explainer_keyword, last_search_keyword],
+                outputs=[explainer_results, explainer_search_results_store, search_status, last_search_keyword]
+            )
+            
+            select_all_btn.click(
+                fn=select_all_items,
+                inputs=[explainer_search_results_store],
+                outputs=[explainer_results]
+            )
+            
+            select_none_btn.click(
+                fn=select_none_items,
+                inputs=[],
+                outputs=[explainer_results]
+            )
+            
+            def safe_generate_explanation(keyword, selected_choices, stored_results):
+                """Wrapper that filters invalid selections before generating explanation."""
+                # First, get the current valid choices from stored_results
+                if stored_results:
+                    from services.storage_service import list_documents
+                    docs = {doc.get('doc_id'): doc.get('name', 'Unknown') for doc in list_documents()}
+                    
+                    valid_choices = set()
+                    for item in stored_results:
+                        doc_id = item.get('doc_id')
+                        section = item.get('section_heading')
+                        doc_name = docs.get(doc_id, 'Unknown')
+                        
+                        display_name = doc_name
+                        if '\\' in display_name:
+                            display_name = display_name.split('\\')[-1]
+                        elif '/' in display_name:
+                            display_name = display_name.split('/')[-1]
+                        
+                        if display_name.lower().endswith('.pdf'):
+                            display_name = display_name[:-4]
+                        
+                        section_display = section if section else "(No section)"
+                        choice_label = f"{display_name} → {section_display}"
+                        valid_choices.add(choice_label)
+                    
+                    # Filter selected_choices to only include valid ones
+                    if selected_choices:
+                        selected_choices = [c for c in selected_choices if c in valid_choices]
+                
+                # Now call the actual function with filtered selections
+                return generate_explanation(keyword, selected_choices or [], stored_results)
+            
+            explain_btn.click(
+                fn=safe_generate_explanation,
+                inputs=[explainer_keyword, explainer_results, explainer_search_results_store],
+                outputs=[explanation_output, source_chunks_output, metadata_output]
             )
         
         with gr.Tab("Manage Documents"):

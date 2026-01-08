@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../unified_rag_app"
+		}
+	],
+	"settings": {}
+}
